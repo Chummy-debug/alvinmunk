@@ -11,13 +11,15 @@ import {
   evidenceMatchesQuest,
   buildQuestEvidenceMap,
   REFERRAL_MARKER_KEY,
+  DEFAULT_QUEST_IDS,
+  MAX_QUEST_ID,
   MAX_REF_LEN,
   type AttestClaim,
   type EvidenceType,
 } from './attest';
 
 const G = 'G'.padEnd(56, 'A'); // a syntactically valid G-address (G + 55 base32 chars)
-const G2 = 'G$.padEnd(56, 'B');
+const G2 = 'G'.padEnd(56, 'B');
 const ctxA = { contractId: 'CQUEST_A', passphrase: 'Test SDF Network ; September 2015' };
 const ctxB = { contractId: 'CQUEST_B', passphrase: 'Public Global Stellar Network ; September 2015' };
 
@@ -76,7 +78,7 @@ describe('validateEvidence', () => {
   });
 
   it('requires a G-address referral and blocks self-referral', () => {
-    expect(validateEvidence({ type: 'referral_tx', ref: G2, }, G).ok).toBe(true);
+    expect(validateEvidence({ type: 'referral_tx', ref: G2 }, G).ok).toBe(true);
     expect(validateEvidence({ type: 'referral_tx', ref: 'nope' }, G).ok).toBe(false);
     expect(validateEvidence({ type: 'referral_tx', ref: G }, G)).toEqual({
       ok: false,
@@ -142,7 +144,7 @@ describe('decodeDataEntry', () => {
   });
 
   it('is exported and the REFERRAL_MARKER_KEY constant is "referral"', () => {
-    expect(REFERAL_MARKER_KEY).toBe('referral');
+    expect(REFERRAL_MARKER_KEY).toBe('referral');
   });
 });
 
@@ -212,33 +214,55 @@ describe('evidenceMatchesQuest', () => {
 describe('buildQuestEvidenceMap', () => {
   it('maps each configured env var to its evidence type', () => {
     const map = buildQuestEvidenceMap({
-      NEXT_PUBLIC_DEFAULT_QUEST_ID: '1',
-      NEXT_PUBLIC_INVITE_QUEST_ID: '3',
-      NEXT_PUBLIC_VOUCHBACK_QUEST_ID: '4',
-      QUEST_GITHUB_ID: '5',
+      NEXT_PUBLIC_DEFAULT_QUEST_ID: '7',
+      NEXT_PUBLIC_INVITE_QUEST_ID: '8',
+      NEXT_PUBLIC_VOUCHBACK_QUEST_ID: '9',
+      QUEST_GITHUB_ID: '1',
     });
-    expect(map.get(1)).toBe('referral_tx');
-    expect(map.get(3)).toBe('invite_converts');
-    expect(map.get(4)).toBe('vouch_back');
-    expect(map.get(5)).toBe('github_pr');
+    expect([...map.entries()].sort(([a], [b]) => a - b)).toEqual([
+      [1, 'github_pr'],
+      [7, 'referral_tx'],
+      [8, 'invite_converts'],
+      [9, 'vouch_back'],
+    ]);
   });
 
-  it('skips unset, empty, non-numeric, out-of-range, and negative values', () => {
+  it('falls back to the dashboard defaults when unset or blank, with github_pr unmapped', () => {
+    const expected = [
+      [2, 'referral_tx'],
+      [3, 'invite_converts'],
+      [4, 'vouch_back'],
+    ];
+    const sorted = (m: Map<number, EvidenceType>) => [...m.entries()].sort(([a], [b]) => a - b);
+    expect(sorted(buildQuestEvidenceMap({}))).toEqual(expected);
+    expect(
+      sorted(
+        buildQuestEvidenceMap({
+          NEXT_PUBLIC_DEFAULT_QUEST_ID: '',
+          NEXT_PUBLIC_INVITE_QUEST_ID: '  ',
+          QUEST_GITHUB_ID: '',
+        }),
+      ),
+    ).toEqual(expected);
+    expect(DEFAULT_QUEST_IDS).toEqual({ referral_tx: 2, invite_converts: 3, vouch_back: 4 });
+  });
+
+  it('leaves a type unmapped when its value is not a plain quest id (no fallback)', () => {
     const map = buildQuestEvidenceMap({
-      NEXT_PUBLIC_DEFAULT_QUEST_ID: undefined,
-      NEXT_PUBLIC_INVITE_QUEST_ID: '',
-      NEXT_PUBLIC_VOUCHBACK_QUEST_ID: 'not-a-number',
-      QUEST_GITHUB_ID: '-1',
+      NEXT_PUBLIC_DEFAULT_QUEST_ID: 'not-a-number',
+      NEXT_PUBLIC_INVITE_QUEST_ID: '-1',
+      NEXT_PUBLIC_VOUCHBACK_QUEST_ID: '4.5',
+      QUEST_GITHUB_ID: String(MAX_QUEST_ID + 1),
     });
     expect(map.size).toBe(0);
+    expect(buildQuestEvidenceMap({ QUEST_GITHUB_ID: '0x10' }).has(16)).toBe(false);
   });
 
-  it('last-wins on duplicate ids so a quest id binds to exactly one type', () => {
-    const map = buildQuestEvidenceMap({
-      NEXT_PUBLIC_DEFAULT_QUEST_ID: '1',
-      NEXT_PUBLIC_INVITE_QUEST_ID: '1',
-    });
-    expect(map.size).toBe(1);
-    expect(map.get(1)).toBe('invite_converts');
+  it('drops a quest id configured for two types, so it binds to none (fail closed)', () => {
+    const map = buildQuestEvidenceMap({ QUEST_GITHUB_ID: '2' }); // collides with the referral default
+    expect(map.has(2)).toBe(false);
+    expect(evidenceMatchesQuest(2, 'referral_tx', map)).toBe(false);
+    expect(evidenceMatchesQuest(2, 'github_pr', map)).toBe(false);
+    expect(map.get(3)).toBe('invite_converts');
   });
 });

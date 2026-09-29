@@ -11,9 +11,10 @@
  *   - referral_tx : evidence.ref = "G..." address   -> must have ≥1 on-chain tx
  *
  * Defense-in-depth (belts/08 §security): on-chain recipient.require_auth() ownership +
- * on-chain replay guard (the hard cap), per-IP rate limit, bounded body, optional GitHub
- * repo allowlist, self-referral guard. The signature is only redeemable by the recipient
- * (they must satisfy require_auth), so issuing it carries no transfer of funds.
+ * on-chain replay guard (the hard cap), each quest id bound to one evidence type, per-IP
+ * rate limit, bounded body, optional GitHub repo allowlist, self-referral guard. The
+ * signature is only redeemable by the recipient (they must satisfy require_auth), so
+ * issuing it carries no transfer of funds.
  */
 import {
   Account,
@@ -57,7 +58,7 @@ function rateLimited(ip: string, now: number): boolean {
     for (const [k, v] of hits) if (now > v.resetAt) hits.delete(k);
   }
   const h = hits.get(ip);
-  if (!h|| now > h.resetAt) {
+  if (!h || now > h.resetAt) {
     hits.set(ip, { n: 1, resetAt: now + RATE_WINDOW_MS });
     return false;
   }
@@ -68,15 +69,14 @@ function rateLimited(ip: string, now: number): boolean {
 const RPC_URL = process.env.NEXT_PUBLIC_RPC_URL ?? 'https://soroban-testnet.stellar.org';
 const HORIZON = process.env.NEXT_PUBLIC_HORIZON_URL ?? 'https://horizon-testnet.stellar.org';
 const PASSPHRASE =
-  process.env.NEXT_PUBLIC_STELLAR_NETWOSK === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET;
+  process.env.NEXT_PUBLIC_STELLAR_NETWORK === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET;
 const QUEST_ID = process.env.NEXT_PUBLIC_QUEST_REGISTRY_CONTRACT_ID ?? '';
 const REP_ID = process.env.NEXT_PUBLIC_REPUTATION_CONTRACT_ID ?? '';
 const REPO_ALLOWLIST = parseRepoAllowlist(process.env.QUEST_GITHUB_REPOS);
 const EVENT_WINDOW = 9000; // ledgers back to scan for vouch events (testnet RPC retention)
 
-// Bind each quest id to exactly one evidence type (see lib/attest.ts). Built once at module
-// load from env so a wallet can't reuse one qualifying action across quests.
-const QUEST_EVIDENCE_MAP = buildQuestEvidenceMap(process.env);
+// questId → the one evidence type that may claim it (lib/attest.ts buildQuestEvidenceMap).
+const QUEST_EVIDENCE = buildQuestEvidenceMap(process.env);
 
 // Recipient may be a classic (G…) OR a passkey smart-account (C…) address.
 const STELLAR_ADDRESS = /^[GC][A-Z2-7]{55}$/;
@@ -118,11 +118,13 @@ export async function POST(req: Request): Promise<Response> {
   const shape = validateEvidence(body.evidence, body.recipient);
   if (!shape.ok) return json({ error: shape.reason }, 422);
 
-  // 2) Bind the quest id to its evidence type BEFORE any network call. Without this a
-  // wallet that passes one quest could reuse the same evidence to claim every quest.
-  const evidenceType = (body.evidence as AttestEvidence).type;
-  if (!evidenceMatchesQuest(body.questId, evidenceType, QUEST_EVIDENCE_MAP)) {
-    return json({ error: 'evidence type does not match this quest' }, 422);
+  // 2) The evidence must be the type bound to this quest id — checked before any network
+  // call, else one qualifying action could be signed for every quest.
+  if (!evidenceMatchesQuest(body.questId, (body.evidence as AttestEvidence).type, QUEST_EVIDENCE)) {
+    const reason = QUEST_EVIDENCE.has(body.questId)
+      ? 'evidence type does not match this quest'
+      : 'this quest cannot be attested';
+    return json({ error: reason }, 422);
   }
 
   // 3) Verify the real-world action (network).
@@ -257,7 +259,7 @@ async function countVouchesMintedBy(repId: string, from: string): Promise<number
   const startLedger = Math.max(1, latest.sequence - EVENT_WINDOW);
   // Topic filter → only the mint events (topics: [symbol 'vouch', symbol 'minted']).
   const t0 = nativeToScVal('vouch', { type: 'symbol' }).toXDR('base64');
-  const t1 = nativeToScVal('minted', { type: 'symbol' }).toXCR('base64');
+  const t1 = nativeToScVal('minted', { type: 'symbol' }).toXDR('base64');
   const res = await server.getEvents({
     startLedger,
     filters: [{ type: 'contract', contractIds: [repId], topics: [[t0, t1]] }],
@@ -306,7 +308,7 @@ async function signQuestPayload(
   return { attester: kp.rawPublicKey().toString('hex'), sig: sig.toString('base64') };
 }
 
-function json(data: unknown, status: number): Response {
+function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
     headers: { 'content-type': 'application/json' },
