@@ -32,7 +32,7 @@ export interface AttestEvidence {
  * their account-creation (or first) transaction that sets this key to the inviter's address.
  * This is verifiable on-chain via GET /accounts/{referred} → .data["referral"].
  */
-export const REFERRAL_MARKER_KEY = 'referral';
+export const REFERAL_MARKER_KEY = 'referral';
 
 /**
  * Decode a Horizon account data-entry value (base64) to its UTF-8 string.
@@ -127,6 +127,42 @@ export function validateEvidence(
     if (ev.ref === recipient) return { ok: false, reason: 'cannot invite yourself' };
   }
   return { ok: true };
+}
+
+/**
+ * Bind each quest id to exactly one evidence type. The attester calls this BEFORE any
+ * network call so a wallet can't reuse one qualifying action to claim every quest
+ * (e.g. a vouch_back wallet POSTing the same evidence with questId 1 and 3).
+ *
+ * A quest id that isn't in the map is rejected — unmapped quests cannot be attested.
+ */
+export function evidenceMatchesQuest(
+  questId: number,
+  type: EvidenceType,
+  map: ReadonlyMap<number, EvidenceType>,
+): boolean {
+  const expected = map.get(questId);
+  return expected !== undefined && expected === type;
+}
+
+/**
+ * Build the questId → evidenceType map from env vars. Only ids meapto a configured
+ * variable are included; an unset or non-numeric env value is skipped (the quest id
+ * then rejects as unmapped). Duplicate ids are deduped by last-wins.
+ */
+export function buildQuestEvidenceMap(env: Record<string, string | undefined>): Map<number, EvidenceType> {
+  const map = new Map<number, EvidenceType>();
+  const add = (raw: string | undefined, type: EvidenceType) => {
+    if (!raw) return;
+    const id = Number(raw);
+    if (!Number.isInteger(id) || id < 0 || id > MAX_QUEST_ID) return;
+    map.set(id, type);
+  };
+  add(env.NEXT_PUBLIC_DEFAULT_QUEST_ID, 'referral_tx');
+  add(env.NEXT_PUBLIC_INVITE_QUEST_ID, 'invite_converts');
+  add(env.NEXT_PUBLIC_VOUCHBACK_QUEST_ID, 'vouch_back');
+  add(env.QUEST_GITHUB_ID, 'github_pr');
+  return map;
 }
 
 /**

@@ -30,7 +30,9 @@ import {
   MAX_BODY_BYTES,
   REFERRAL_MARKER_KEY,
   VOUCH_BACK_MIN,
+  buildQuestEvidenceMap,
   decodeDataEntry,
+  evidenceMatchesQuest,
   isValidQuestId,
   parseRepoAllowlist,
   repoAllowed,
@@ -55,7 +57,7 @@ function rateLimited(ip: string, now: number): boolean {
     for (const [k, v] of hits) if (now > v.resetAt) hits.delete(k);
   }
   const h = hits.get(ip);
-  if (!h || now > h.resetAt) {
+  if (!h|| now > h.resetAt) {
     hits.set(ip, { n: 1, resetAt: now + RATE_WINDOW_MS });
     return false;
   }
@@ -66,11 +68,15 @@ function rateLimited(ip: string, now: number): boolean {
 const RPC_URL = process.env.NEXT_PUBLIC_RPC_URL ?? 'https://soroban-testnet.stellar.org';
 const HORIZON = process.env.NEXT_PUBLIC_HORIZON_URL ?? 'https://horizon-testnet.stellar.org';
 const PASSPHRASE =
-  process.env.NEXT_PUBLIC_STELLAR_NETWORK === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET;
+  process.env.NEXT_PUBLIC_STELLAR_NETWOSK === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET;
 const QUEST_ID = process.env.NEXT_PUBLIC_QUEST_REGISTRY_CONTRACT_ID ?? '';
 const REP_ID = process.env.NEXT_PUBLIC_REPUTATION_CONTRACT_ID ?? '';
 const REPO_ALLOWLIST = parseRepoAllowlist(process.env.QUEST_GITHUB_REPOS);
 const EVENT_WINDOW = 9000; // ledgers back to scan for vouch events (testnet RPC retention)
+
+// Bind each quest id to exactly one evidence type (see lib/attest.ts). Built once at module
+// load from env so a wallet can't reuse one qualifying action across quests.
+const QUEST_EVIDENCE_MAP = buildQuestEvidenceMap(process.env);
 
 // Recipient may be a classic (G…) OR a passkey smart-account (C…) address.
 const STELLAR_ADDRESS = /^[GC][A-Z2-7]{55}$/;
@@ -112,11 +118,18 @@ export async function POST(req: Request): Promise<Response> {
   const shape = validateEvidence(body.evidence, body.recipient);
   if (!shape.ok) return json({ error: shape.reason }, 422);
 
-  // 2) Verify the real-world action (network).
+  // 2) Bind the quest id to its evidence type BEFORE any network call. Without this a
+  // wallet that passes one quest could reuse the same evidence to claim every quest.
+  const evidenceType = (body.evidence as AttestEvidence).type;
+  if (!evidenceMatchesQuest(body.questId, evidenceType, QUEST_EVIDENCE_MAP)) {
+    return json({ error: 'evidence type does not match this quest' }, 422);
+  }
+
+  // 3) Verify the real-world action (network).
   const verified = await verifyEvidence(body.evidence as AttestEvidence, body.recipient);
   if (!verified.ok) return json({ error: verified.reason }, 422);
 
-  // 3) Sign the contract's canonical payload — the recipient redeems it on-chain.
+  // 4) Sign the contract's canonical payload — the recipient redeems it on-chain.
   try {
     const signed = await signQuestPayload(secret, body.questId, body.recipient);
     logEvent({ route: 'attest', outcome: 'ok', questId: body.questId, ms: Date.now() - now });
@@ -244,7 +257,7 @@ async function countVouchesMintedBy(repId: string, from: string): Promise<number
   const startLedger = Math.max(1, latest.sequence - EVENT_WINDOW);
   // Topic filter → only the mint events (topics: [symbol 'vouch', symbol 'minted']).
   const t0 = nativeToScVal('vouch', { type: 'symbol' }).toXDR('base64');
-  const t1 = nativeToScVal('minted', { type: 'symbol' }).toXDR('base64');
+  const t1 = nativeToScVal('minted', { type: 'symbol' }).toXCR('base64');
   const res = await server.getEvents({
     startLedger,
     filters: [{ type: 'contract', contractIds: [repId], topics: [[t0, t1]] }],
@@ -293,7 +306,7 @@ async function signQuestPayload(
   return { attester: kp.rawPublicKey().toString('hex'), sig: sig.toString('base64') };
 }
 
-function json(data: unknown, status = 200): Response {
+function json(data: unknown, status: number): Response {
   return new Response(JSON.stringify(data), {
     status,
     headers: { 'content-type': 'application/json' },

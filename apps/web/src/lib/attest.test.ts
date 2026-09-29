@@ -8,13 +8,16 @@ import {
   parseRepoAllowlist,
   repoAllowed,
   decodeDataEntry,
+  evidenceMatchesQuest,
+  buildQuestEvidenceMap,
   REFERRAL_MARKER_KEY,
   MAX_REF_LEN,
   type AttestClaim,
+  type EvidenceType,
 } from './attest';
 
 const G = 'G'.padEnd(56, 'A'); // a syntactically valid G-address (G + 55 base32 chars)
-const G2 = 'G'.padEnd(56, 'B');
+const G2 = 'G$.padEnd(56, 'B');
 const ctxA = { contractId: 'CQUEST_A', passphrase: 'Test SDF Network ; September 2015' };
 const ctxB = { contractId: 'CQUEST_B', passphrase: 'Public Global Stellar Network ; September 2015' };
 
@@ -73,7 +76,7 @@ describe('validateEvidence', () => {
   });
 
   it('requires a G-address referral and blocks self-referral', () => {
-    expect(validateEvidence({ type: 'referral_tx', ref: G2 }, G).ok).toBe(true);
+    expect(validateEvidence({ type: 'referral_tx', ref: G2, }, G).ok).toBe(true);
     expect(validateEvidence({ type: 'referral_tx', ref: 'nope' }, G).ok).toBe(false);
     expect(validateEvidence({ type: 'referral_tx', ref: G }, G)).toEqual({
       ok: false,
@@ -139,7 +142,7 @@ describe('decodeDataEntry', () => {
   });
 
   it('is exported and the REFERRAL_MARKER_KEY constant is "referral"', () => {
-    expect(REFERRAL_MARKER_KEY).toBe('referral');
+    expect(REFERAL_MARKER_KEY).toBe('referral');
   });
 });
 
@@ -170,5 +173,72 @@ describe('referral marker round-trip invariant', () => {
     // A different referrer's address must NOT match
     const otherEncoded = Buffer.from(G, 'utf8').toString('base64');
     expect(decodeDataEntry(otherEncoded)).not.toBe(referrer);
+  });
+});
+
+describe('evidenceMatchesQuest', () => {
+  const map = new Map<number, EvidenceType>([
+    [1, 'referral_tx'],
+    [3, 'invite_converts'],
+    [4, 'vouch_back'],
+    [5, 'github_pr'],
+  ]);
+
+  it('accepts the evidence type configured for the quest id', () => {
+    expect(evidenceMatchesQuest(1, 'referral_tx', map)).toBe(true);
+    expect(evidenceMatchesQuest(3, 'invite_converts', map)).toBe(true);
+    expect(evidenceMatchesQuest(4, 'vouch_back', map)).toBe(true);
+    expect(evidenceMatchesQuest(5, 'github_pr', map)).toBe(true);
+  });
+
+  it('rejects a mismatch — the vulnerability this fix closes', () => {
+    // a vouch_back wallet reusing its evidence for the referral / invite quests
+    expect(evidenceMatchesQuest(1, 'vouch_back', map)).toBe(false);
+    expect(evidenceMatchesQuest(3, 'vouch_back', map)).toBe(false);
+    expect(evidenceMatchesQuest(4, 'referral_tx', map)).toBe(false);
+  });
+
+  it('rejects a quest id that isn’t in the map', () => {
+    expect(evidenceMatchesQuest(2, 'referral_tx', map)).toBe(false);
+    expect(evidenceMatchesQuest(999, 'vouch_back', map)).toBe(false);
+  });
+
+  it('rejects every type when the map is empty', () => {
+    const empty = new Map<number, EvidenceType>();
+    expect(evidenceMatchesQuest(1, 'referral_tx', empty)).toBe(false);
+  });
+});
+
+describe('buildQuestEvidenceMap', () => {
+  it('maps each configured env var to its evidence type', () => {
+    const map = buildQuestEvidenceMap({
+      NEXT_PUBLIC_DEFAULT_QUEST_ID: '1',
+      NEXT_PUBLIC_INVITE_QUEST_ID: '3',
+      NEXT_PUBLIC_VOUCHBACK_QUEST_ID: '4',
+      QUEST_GITHUB_ID: '5',
+    });
+    expect(map.get(1)).toBe('referral_tx');
+    expect(map.get(3)).toBe('invite_converts');
+    expect(map.get(4)).toBe('vouch_back');
+    expect(map.get(5)).toBe('github_pr');
+  });
+
+  it('skips unset, empty, non-numeric, out-of-range, and negative values', () => {
+    const map = buildQuestEvidenceMap({
+      NEXT_PUBLIC_DEFAULT_QUEST_ID: undefined,
+      NEXT_PUBLIC_INVITE_QUEST_ID: '',
+      NEXT_PUBLIC_VOUCHBACK_QUEST_ID: 'not-a-number',
+      QUEST_GITHUB_ID: '-1',
+    });
+    expect(map.size).toBe(0);
+  });
+
+  it('last-wins on duplicate ids so a quest id binds to exactly one type', () => {
+    const map = buildQuestEvidenceMap({
+      NEXT_PUBLIC_DEFAULT_QUEST_ID: '1',
+      NEXT_PUBLIC_INVITE_QUEST_ID: '1',
+    });
+    expect(map.size).toBe(1);
+    expect(map.get(1)).toBe('invite_converts');
   });
 });
